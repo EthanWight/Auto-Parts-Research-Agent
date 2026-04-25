@@ -124,8 +124,14 @@ class WorkflowState(TypedDict):
             the summarizer agent.  Presented to the human for approval.
 
         approved (bool): Set to ``True`` by the human checkpoint agent when
-            the operator types "y" or "yes".  Controls graph routing after
+            the operator types "Y" or "yes".  Controls graph routing after
             the checkpoint.
+
+        operator_feedback (str): Optional revision instructions entered by the
+            operator when they reject a draft.  Passed to the summarizer on
+            the next iteration so the LLM can adjust tone, depth, or focus.
+            Reset to an empty string each time the operator approves or starts
+            a fresh rejection cycle.
 
         recommendation (str): The final, operator-approved recommendation.
             Populated by the finalize agent only when ``approved`` is ``True``.
@@ -139,6 +145,7 @@ class WorkflowState(TypedDict):
     raw_search_notes: list[str]
     draft_summary: str
     approved: bool
+    operator_feedback: str
     recommendation: str
 
 
@@ -166,9 +173,10 @@ def _default_state(vehicle_problem: str) -> WorkflowState:
         "current_step": 0,     # Incremented by research_agent each iteration.
         "findings": [],        # Audit log appended to by research_agent.
         "raw_search_notes": [], # Raw DuckDuckGo snippets collected per step.
-        "draft_summary": "",   # Written by summarizer_agent.
-        "approved": False,     # Flipped to True by human_checkpoint_agent.
-        "recommendation": "",  # Written by finalize_agent on approval.
+        "draft_summary": "",      # Written by summarizer_agent.
+        "approved": False,        # Flipped to True by human_checkpoint_agent.
+        "operator_feedback": "",  # Revision notes captured on rejection.
+        "recommendation": "",     # Written by finalize_agent on approval.
     }
 
 
@@ -482,12 +490,26 @@ def summarizer_agent(state: WorkflowState) -> WorkflowState:
     # LLM has full traceability of where each piece of evidence came from.
     evidence = "\n\n".join(state["raw_search_notes"])
 
+    # If the operator rejected a previous draft and left revision notes, append
+    # them to the user turn so the LLM knows exactly what to change.  The
+    # section is only added when feedback is non-empty to keep the prompt clean
+    # on the first summarisation pass.
+    feedback_section = ""
+    if state.get("operator_feedback"):
+        feedback_section = f"\n\nOperator revision notes:\n{state['operator_feedback']}"
+
     # Two-turn prompt: system persona sets the advisory role, user turn provides
-    # the problem statement and all collected evidence for the LLM to synthesise.
+    # the problem statement, all collected evidence, and any operator feedback.
     response = llm.invoke(
         [
             SystemMessage(content=prompt),
-            HumanMessage(content=f"Problem:\n{state['vehicle_problem']}\n\nEvidence:\n{evidence}"),
+            HumanMessage(
+                content=(
+                    f"Problem:\n{state['vehicle_problem']}\n\n"
+                    f"Evidence:\n{evidence}"
+                    f"{feedback_section}"
+                )
+            ),
         ]
     )
 
@@ -500,7 +522,75 @@ def summarizer_agent(state: WorkflowState) -> WorkflowState:
 
 
 # ---------------------------------------------------------------------------
-# Node 4 — Human-in-the-loop checkpoint
+# Node 4 — Formatter agent
+# ---------------------------------------------------------------------------
+
+@traceable(name="formatter_agent")
+def formatter_agent(state: WorkflowState) -> WorkflowState:
+    """Rewrite the technical draft summary into a clean, plain-English report.
+
+    The summarizer agent produces a content-rich but often dense recommendation.
+    This node passes that draft through the LLM a second time with a different
+    persona — a friendly service advisor explaining findings to a car owner —
+    so the final text presented at the human checkpoint is approachable and
+    easy to act on, regardless of the reader's technical background.
+
+    The formatter does **not** change the factual content or add new information;
+    it only improves presentation.  The rewritten text overwrites ``draft_summary``
+    in place so the human checkpoint and finalize nodes see the polished version
+    without any additional state fields.
+
+    Formatting guidelines applied by the LLM:
+    - Clear, numbered or bulleted sections with bold headings.
+    - Short sentences and plain language — no unexplained jargon.
+    - Actionable language (e.g. "Take it to a shop to…" rather than "Validation
+      should be performed…").
+    - A brief plain-English summary paragraph at the top before the sections,
+      so the reader immediately understands the bottom line.
+
+    Args:
+        state: The current :class:`WorkflowState`.  Reads ``draft_summary``;
+            overwrites ``draft_summary`` with the formatted version.
+
+    Returns:
+        The updated :class:`WorkflowState` with ``draft_summary`` replaced by
+        the human-friendly formatted report.
+    """
+    llm = _maybe_llm()
+    print("[formatter] Polishing summary for readability...")
+
+    # System prompt: shifts the LLM's persona from technical analyst to
+    # friendly service advisor writing for a non-technical car owner.
+    prompt = (
+        "You are a friendly automotive service advisor writing a report for a car owner "
+        "who is not a mechanic. Rewrite the following technical recommendation so it is "
+        "easy to understand and pleasant to read. Follow these rules:\n"
+        "1. Start with a short 2-3 sentence plain-English summary of the bottom line.\n"
+        "2. Use bold headings for each section.\n"
+        "3. Use bullet points for lists of steps or parts.\n"
+        "4. Replace technical jargon with simple language, or explain it in parentheses.\n"
+        "5. Use active, actionable language (e.g. 'Check the spark plugs' not "
+        "'Spark plug inspection should be performed').\n"
+        "6. Keep the same four sections: Likely Cause, Validation Steps, "
+        "Suggested Parts, and Confidence Level.\n"
+        "Do not add new facts or remove any important information from the original."
+    )
+
+    response = llm.invoke(
+        [
+            SystemMessage(content=prompt),
+            # Pass the raw technical draft as the content to be reformatted.
+            HumanMessage(content=state["draft_summary"]),
+        ]
+    )
+
+    # Strip any <think> block and overwrite the draft with the polished version.
+    state["draft_summary"] = _strip_thinking(str(response.content))
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Node 5 — Human-in-the-loop checkpoint
 # ---------------------------------------------------------------------------
 
 @traceable(name="human_checkpoint_agent")
@@ -538,11 +628,22 @@ def human_checkpoint_agent(state: WorkflowState) -> WorkflowState:
 
     # Block and wait for the operator's decision.  strip() removes accidental
     # leading/trailing spaces; lower() makes the check case-insensitive.
-    answer = input("Approve this recommendation draft? [y/N]: ").strip().lower()
+    # [Y/n] — uppercase Y signals that approval is the expected/default choice.
+    answer = input("Approve this recommendation draft? [Y/n]: ").strip().lower()
 
-    # Accept both "y" and "yes" as affirmative answers; everything else
-    # (including just pressing Enter) is treated as rejection.
-    state["approved"] = answer in {"y", "yes"}
+    # Accept "y", "yes", or a bare Enter (empty string) as affirmative answers.
+    # Any other input (e.g. "n", "no", "redo") is treated as rejection.
+    approved = answer in {"y", "yes", ""}
+    state["approved"] = approved
+
+    if not approved:
+        # Prompt the operator for specific revision instructions.  These notes
+        # are stored in state and injected into the next summariser call so the
+        # LLM knows exactly what to change (e.g. "focus more on electrical
+        # components" or "add OEM part numbers").
+        feedback = input("What should be changed? Provide revision notes for the AI: ").strip()
+        state["operator_feedback"] = feedback
+
     return state
 
 
@@ -568,7 +669,7 @@ def route_after_checkpoint(state: WorkflowState) -> Literal["finalize", "summari
 
 
 # ---------------------------------------------------------------------------
-# Node 5 — Finalize agent
+# Node 6 — Finalize agent
 # ---------------------------------------------------------------------------
 
 @traceable(name="finalize_agent")
@@ -626,6 +727,9 @@ def build_graph():
                                          summarize               │
                                              │                   │
                                              ▼                   │
+                                         formatter               │
+                                             │                   │
+                                             ▼                   │
                                     human_checkpoint             │
                                              │                   │
                                route_after_checkpoint            │
@@ -645,6 +749,7 @@ def build_graph():
     graph.add_node("planner", planner_agent)
     graph.add_node("research", research_agent)
     graph.add_node("summarize", summarizer_agent)
+    graph.add_node("formatter", formatter_agent)
     graph.add_node("human_checkpoint", human_checkpoint_agent)
     graph.add_node("finalize", finalize_agent)
 
@@ -662,8 +767,11 @@ def build_graph():
         {"research": "research", "summarize": "summarize"},
     )
 
-    # Unconditional edge: after summarisation, always request human review.
-    graph.add_edge("summarize", "human_checkpoint")
+    # Unconditional edge: after summarisation, always polish for readability.
+    graph.add_edge("summarize", "formatter")
+
+    # Unconditional edge: after formatting, present the polished draft for review.
+    graph.add_edge("formatter", "human_checkpoint")
 
     # Conditional edge: after human review, either finalise (approved) or
     # regenerate the summary (rejected) and loop back through human_checkpoint.
