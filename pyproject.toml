@@ -1,0 +1,23 @@
+[project]
+name = "auto-parts-research-agent"
+version = "0.1.0"
+description = "LangGraph multi-agent workflow demo for auto-parts troubleshooting research"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "langgraph>=0.2.0",
+  "langchain>=0.3.0",
+  "langchain-openai>=0.2.0",
+  "langchain-community>=0.3.0",
+  "pydantic>=2.9.0",
+]
+
+[project.scripts]
+auto-parts-agent = "auto_parts_research_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
