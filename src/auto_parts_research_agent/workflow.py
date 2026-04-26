@@ -26,6 +26,8 @@ import argparse
 import json
 import os
 import re
+from datetime import datetime
+from pathlib import Path
 from typing import Literal, TypedDict
 
 from dotenv import load_dotenv
@@ -553,8 +555,23 @@ def main() -> None:
 
     result = run_research(problem)
 
+    recommendation = result.get("recommendation") or "No recommendation approved."
+
     print("\n===== FINAL RECOMMENDATION =====")
-    print(result.get("recommendation") or "No recommendation approved.")
+    print(recommendation)
+
+    # Save the report as a Markdown file in the reports/ folder.
+    reports_dir = Path("reports")
+    reports_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = reports_dir / f"report_{timestamp}.md"
+
+    header = f"# Auto Parts Research Report\n\n**Date:** {datetime.now().strftime('%B %d, %Y %I:%M %p')}\n"
+    header += f"**Vehicle Problem:** {result['vehicle_problem']}\n\n---\n\n"
+
+    filename.write_text(header + recommendation, encoding="utf-8")
+    print(f"\nReport saved to {filename}")
 
 
 if __name__ == "__main__":
