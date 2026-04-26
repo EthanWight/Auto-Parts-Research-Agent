@@ -7,7 +7,8 @@
       "Bash(pip install langsmith python-dotenv -q)",
       "Bash(curl -s http://localhost:11434/v1/chat/completions -H \"Content-Type: application/json\" -d '{\"model\":\"qwen3.6:latest\",\"messages\":[{\"role\":\"user\",\"content\":\"Say OK\"}],\"stream\":false}' 2>&1)",
       "Bash(time curl -s http://localhost:11434/v1/chat/completions -H \"Content-Type: application/json\" -d '{\"model\":\"qwen3.6:latest\",\"messages\":[{\"role\":\"system\",\"content\":\"You are an automotive diagnostics planner. Return ONLY a JSON object with key plan as an array of 3-5 concise steps. No explanation or markdown, only valid JSON.\"},{\"role\":\"user\",\"content\":\"2014 Ford Focus rough idle and intermittent check engine light\"}],\"stream\":false,\"think\":false}' 2>&1 | python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(d['choices'][0]['message']['content']\\)\")",
-      "Bash('/c/Users/ethan/AppData/Local/Programs/Ollama/ollama.exe' list)"
+      "Bash('/c/Users/ethan/AppData/Local/Programs/Ollama/ollama.exe' list)",
+      "Bash(pip install rich -q)"
     ]
   }
 }

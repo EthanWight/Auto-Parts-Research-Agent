@@ -23,6 +23,7 @@ Environment variables (loaded from ".env"):
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -36,9 +37,17 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langsmith import traceable
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.text import Text
 
 # Load environment variables from .env before any os.getenv() calls.
 load_dotenv()
+
+# Shared Rich console used for all terminal output.
+console = Console()
 
 
 class WorkflowState(TypedDict):
@@ -54,6 +63,8 @@ class WorkflowState(TypedDict):
         findings: Human-readable audit log of completed research steps.
         raw_search_notes: Unprocessed DuckDuckGo result blocks per step.
         draft_summary: Recommendation text from the summarizer/formatter.
+        previous_draft: Snapshot of the last draft shown to the operator,
+            used to display a diff when a revised version comes back.
         approved: True when the operator approves the draft.
         operator_feedback: Revision notes entered on rejection, passed to the
             summarizer on the next iteration.
@@ -66,6 +77,7 @@ class WorkflowState(TypedDict):
     findings: list[str]
     raw_search_notes: list[str]
     draft_summary: str
+    previous_draft: str
     approved: bool
     operator_feedback: str
     recommendation: str
@@ -87,6 +99,7 @@ def _default_state(vehicle_problem: str) -> WorkflowState:
         "findings": [],
         "raw_search_notes": [],
         "draft_summary": "",
+        "previous_draft": "",
         "approved": False,
         "operator_feedback": "",
         "recommendation": "",
@@ -128,6 +141,39 @@ def _maybe_llm() -> ChatOpenAI:
     )
 
 
+def _show_diff(old: str, new: str) -> None:
+    """Display a colored unified diff between two draft versions.
+
+    Green lines are additions in the new draft, red lines are removals
+    from the old draft. Unchanged context lines are shown in dim white.
+
+    Args:
+        old: The previous draft text.
+        new: The revised draft text.
+    """
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    diff = difflib.unified_diff(old_lines, new_lines, fromfile="Previous Draft", tofile="Revised Draft")
+
+    diff_text = Text()
+    has_content = False
+    for line in diff:
+        has_content = True
+        if line.startswith("+") and not line.startswith("+++"):
+            diff_text.append(line, style="green")
+        elif line.startswith("-") and not line.startswith("---"):
+            diff_text.append(line, style="red")
+        elif line.startswith("@@"):
+            diff_text.append(line, style="cyan")
+        else:
+            diff_text.append(line, style="dim")
+
+    if has_content:
+        console.print(Panel(diff_text, title="Changes From Previous Draft", border_style="yellow"))
+    else:
+        console.print("[dim]No differences detected.[/dim]")
+
+
 # ---------------------------------------------------------------------------
 # Node 1 - Planner
 # ---------------------------------------------------------------------------
@@ -139,7 +185,7 @@ def planner_agent(state: WorkflowState) -> WorkflowState:
     This function sends the problem to the LLM with a strict "JSON only"
     system prompt. It applies two fallback layers to handle quirky LLM output:
     1. Strips any <think> block, then extracts the first JSON object via regex.
-    2. If JSON parsing fails, splits the response into lines and takes the
+    2. If JSON parsing fails, it splits the response into lines and takes the
        first four non-empty lines as plan steps.
 
     Args:
@@ -152,7 +198,7 @@ def planner_agent(state: WorkflowState) -> WorkflowState:
     llm = _maybe_llm()
     problem = state["vehicle_problem"]
 
-    print("[planner] Building research plan...")
+    console.print("\n[bold cyan]Building research plan...[/bold cyan]")
 
     prompt = (
         "You are an automotive diagnostics planner for an auto-parts research workflow. "
@@ -165,16 +211,14 @@ def planner_agent(state: WorkflowState) -> WorkflowState:
     content = _strip_thinking(str(response.content))
 
     try:
-        # Extract the first JSON object from the response.
         match = re.search(r"\{.*}", content, re.DOTALL)
         payload = json.loads(match.group() if match else content)
         plan = payload["plan"]
     except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
-        # Fallback: treat each non-empty line as a plan step.
         plan = [line.strip("- ") for line in content.splitlines() if line.strip()][:4]
 
     for i, step in enumerate(plan, 1):
-        print(f"  {i}. {step}")
+        console.print(f"  [green]{i}.[/green] {step}")
 
     state["plan"] = plan
     state["current_step"] = 0
@@ -219,7 +263,9 @@ def research_agent(state: WorkflowState) -> WorkflowState:
     except Exception as exc:
         results = f"Search unavailable: {exc}"
 
-    print(f"[research] Step {step_index + 1}/{len(plan)}: {step}")
+    console.print(
+        f"  [bold blue]Researching[/bold blue] [{step_index + 1}/{len(plan)}] {step}"
+    )
 
     note = f"Step {step_index + 1}: {step}\nResearch Notes: {results}"
     state["raw_search_notes"].append(note)
@@ -268,7 +314,7 @@ def summarizer_agent(state: WorkflowState) -> WorkflowState:
         The updated state with the draft summary populated.
     """
     llm = _maybe_llm()
-    print("[summarizer] Generating recommendation draft...")
+    console.print("\n[bold cyan]Generating recommendation draft...[/bold cyan]")
 
     prompt = (
         "You are a senior parts advisor. Build a concise recommendation with sections: "
@@ -277,7 +323,6 @@ def summarizer_agent(state: WorkflowState) -> WorkflowState:
 
     evidence = "\n\n".join(state["raw_search_notes"])
 
-    # Append operator revision notes when present (empty on first pass).
     feedback_section = ""
     if state.get("operator_feedback"):
         feedback_section = f"\n\nOperator revision notes:\n{state['operator_feedback']}"
@@ -320,7 +365,7 @@ def formatter_agent(state: WorkflowState) -> WorkflowState:
         The updated state with a human-friendly draft summary.
     """
     llm = _maybe_llm()
-    print("[formatter] Polishing summary for readability...")
+    console.print("[bold cyan]Polishing for readability...[/bold cyan]")
 
     prompt = (
         "You are a friendly automotive service advisor writing a report for a car owner "
@@ -329,7 +374,7 @@ def formatter_agent(state: WorkflowState) -> WorkflowState:
         "1. Start with a short 2-3 sentence plain-English summary of the bottom line.\n"
         "2. Use bold headings for each section.\n"
         "3. Use bullet points for lists of steps or parts.\n"
-        "4. Replace technical jargon with simple language, or explain it in parentheses.\n"
+        "4. Replace technical jargon with simple, everyday language.\n"
         "5. Use active, actionable language ('Check the spark plugs' not "
         "'Spark plug inspection should be performed').\n"
         "6. Keep the same four sections: Likely Cause, Validation Steps, "
@@ -356,33 +401,57 @@ def formatter_agent(state: WorkflowState) -> WorkflowState:
 def human_checkpoint_agent(state: WorkflowState) -> WorkflowState:
     """Present the draft to the operator and capture approval or feedback.
 
-    Prints the formatted recommendation and blocks on input(). The operator
-    types Y/yes/Enter to approve, or anything else to reject. On rejection,
-    the operator is prompted for revision notes that get fed back into
-    the summarizer on the next pass.
+    Renders the recommendation as formatted Markdown inside a Rich panel.
+    If a previous draft exists (meaning this is a revision cycle), a colored
+    diff is shown first so the operator can see exactly what changed.
 
-    Note: This node calls input() and is not suitable for headless runs.
+    The operator types Y/yes/Enter to approve, or anything else to reject.
+    On rejection, the operator provides revision notes that get fed back
+    into the summarizer on the next pass.
 
     Args:
-        state: Current workflow state. Reads "draft_summary", writes
-            "approved" and (on rejection) "operator_feedback".
+        state: Current workflow state. Reads "draft_summary" and
+            "previous_draft". Writes "approved", "operator_feedback",
+            and "previous_draft".
 
     Returns:
         The updated state with the approval decision is recorded.
     """
-    print("\n========== HUMAN CHECKPOINT ==========")
-    print(state["draft_summary"])
-    print("=====================================\n")
+    console.print()
 
-    answer = input("Approve this recommendation draft? [Y/N]: ").strip().lower()
+    # If there is a previous draft, show the diff so the user can see
+    # exactly what the AI changed based on their feedback.
+    if state.get("previous_draft"):
+        _show_diff(state["previous_draft"], state["draft_summary"])
+        console.print()
 
-    # Y, yes, or bare Enter all count as approval.
-    approved = answer in {"y", "yes", "", "Y"}
+    # Render the current draft as formatted Markdown inside a bordered panel.
+    console.print(
+        Panel(
+            Markdown(state["draft_summary"]),
+            title="[bold]Draft Recommendation[/bold]",
+            border_style="bright_blue",
+            padding=(1, 2),
+        )
+    )
+
+    console.print("\n[bold]Approve this recommendation?[/bold] [dim](Y/N)[/dim] ", end="")
+    answer = input().strip().lower()
+
+    approved = answer in {"y", "yes", ""}
     state["approved"] = approved
 
     if not approved:
-        feedback = input("What should be changed? Provide revision notes for the AI: ").strip()
+        # Save the current draft so we can diff against the next revision.
+        state["previous_draft"] = state["draft_summary"]
+
+        console.print(
+            "\n[yellow]Tell the AI what to change. Be as specific as you like "
+            "(e.g., add part numbers, focus on electrical, shorter summary).[/yellow]"
+        )
+        feedback = Prompt.ask("[bold]Revision notes[/bold]")
         state["operator_feedback"] = feedback
+        console.print("\n[dim]Regenerating draft with your feedback...[/dim]")
 
     return state
 
@@ -501,28 +570,37 @@ def run_research(vehicle_problem: str) -> WorkflowState:
 # ---------------------------------------------------------------------------
 
 def _gather_vehicle_info() -> str:
-    """Prompt the user for vehicle details and symptoms interactively.
+    """Prompt the user for vehicle details and symptoms using Rich prompts.
 
-    Asks a series of short questions to build a complete problem description.
-    The answers are combined into a single string that the planner agent
-    can work with effectively.
+    Asks a series of short questions inside a styled panel and combines
+    the answers into a single problem description string.
 
     Returns:
         A combined problem description string.
     """
-    print("===== Auto Parts Research Agent =====\n")
+    console.print(
+        Panel(
+            "[bold white]Welcome! Answer a few questions about your vehicle\n"
+            "and the issue you are experiencing.[/bold white]",
+            title="[bold bright_blue]Auto Parts Research Agent[/bold bright_blue]",
+            border_style="bright_blue",
+            padding=(1, 2),
+        )
+    )
+    console.print()
 
-    year = input("What year is your vehicle? ").strip()
-    make = input("What is the make (e.g., Ford, Toyota, Honda)? ").strip()
-    model = input("What is the model (e.g., Focus, Camry, Civic)? ").strip()
-    mileage = input("Approximate mileage? ").strip()
-    symptoms = input("Describe the issue you are experiencing:\n> ").strip()
-    when = input("When does it happen (e.g., at startup, while driving, always)? ").strip()
-    extras = input("Any warning lights, codes, or other details? (press Enter to skip)\n> ").strip()
+    year = Prompt.ask("[bold]Vehicle year[/bold]")
+    make = Prompt.ask("[bold]Make[/bold]")
+    model = Prompt.ask("[bold]Model[/bold]")
+    mileage = Prompt.ask("[bold]Approximate mileage[/bold]")
+    console.print()
+    symptoms = Prompt.ask("[bold]Describe the issue you are experiencing[/bold]")
+    when = Prompt.ask("[bold]When does it happen?[/bold]")
+    extras = Prompt.ask("[bold]Any warning lights, codes, or other details?[/bold]")
 
     parts = [f"{year} {make} {model}"]
     if mileage:
-        parts.append(f"with {mileage} miles")
+        parts.append(f"with approximately {mileage} miles")
     parts.append(f"is experiencing: {symptoms}.")
     if when:
         parts.append(f"This happens {when}.")
@@ -531,8 +609,41 @@ def _gather_vehicle_info() -> str:
 
     problem = " ".join(parts)
 
-    print(f"\nResearching: {problem}\n")
+    console.print()
+    console.print(
+        Panel(problem, title="[bold]Researching[/bold]", border_style="green", padding=(1, 2))
+    )
+    console.print()
+
     return problem
+
+
+def _save_report(result: WorkflowState) -> Path:
+    """Save the approved recommendation to a Markdown file in the reports' folder.
+
+    Args:
+        result: The final workflow state containing the recommendation.
+
+    Returns:
+        The path to the saved report file.
+    """
+    reports_dir = Path("reports")
+    reports_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = reports_dir / f"report_{timestamp}.md"
+
+    now = datetime.now().strftime("%B %d, %Y %I:%M %p")
+    content = (
+        f"# Auto Parts Research Report\n\n"
+        f"**Date:** {now}\n\n"
+        f"**Vehicle Problem:** {result['vehicle_problem']}\n\n"
+        f"---\n\n"
+        f"{result['recommendation']}\n"
+    )
+
+    filename.write_text(content, encoding="utf-8")
+    return filename
 
 
 def main() -> None:
@@ -555,23 +666,25 @@ def main() -> None:
 
     result = run_research(problem)
 
-    recommendation = result.get("recommendation") or "No recommendation approved."
+    recommendation = result.get("recommendation", "")
 
-    print("\n===== FINAL RECOMMENDATION =====")
-    print(recommendation)
+    if recommendation:
+        console.print()
+        console.print(
+            Panel(
+                Markdown(recommendation),
+                title="[bold green]Final Approved Recommendation[/bold green]",
+                border_style="green",
+                padding=(1, 2),
+            )
+        )
 
-    # Save the report as a Markdown file in the reports/ folder.
-    reports_dir = Path("reports")
-    reports_dir.mkdir(exist_ok=True)
+        filepath = _save_report(result)
+        console.print(f"\n[bold green]Report saved to:[/bold green] {filepath}")
+    else:
+        console.print("\n[bold red]No recommendation was approved.[/bold red]")
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = reports_dir / f"report_{timestamp}.md"
-
-    header = f"# Auto Parts Research Report\n\n**Date:** {datetime.now().strftime('%B %d, %Y %I:%M %p')}\n"
-    header += f"**Vehicle Problem:** {result['vehicle_problem']}\n\n---\n\n"
-
-    filename.write_text(header + recommendation, encoding="utf-8")
-    print(f"\nReport saved to {filename}")
+    console.print()
 
 
 if __name__ == "__main__":
