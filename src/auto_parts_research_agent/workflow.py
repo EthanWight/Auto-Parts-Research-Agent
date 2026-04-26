@@ -498,22 +498,60 @@ def run_research(vehicle_problem: str) -> WorkflowState:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    """Parse CLI arguments and run the research pipeline.
+def _gather_vehicle_info() -> str:
+    """Prompt the user for vehicle details and symptoms interactively.
 
-    Accepts an optional positional argument for the vehicle problem.
-    Falls back to a default example if none is provided.
+    Asks a series of short questions to build a complete problem description.
+    The answers are combined into a single string that the planner agent
+    can work with effectively.
+
+    Returns:
+        A combined problem description string.
+    """
+    print("===== Auto Parts Research Agent =====\n")
+
+    year = input("What year is your vehicle? ").strip()
+    make = input("What is the make (e.g., Ford, Toyota, Honda)? ").strip()
+    model = input("What is the model (e.g., Focus, Camry, Civic)? ").strip()
+    mileage = input("Approximate mileage? ").strip()
+    symptoms = input("Describe the issue you are experiencing:\n> ").strip()
+    when = input("When does it happen (e.g., at startup, while driving, always)? ").strip()
+    extras = input("Any warning lights, codes, or other details? (press Enter to skip)\n> ").strip()
+
+    parts = [f"{year} {make} {model}"]
+    if mileage:
+        parts.append(f"with {mileage} miles")
+    parts.append(f"is experiencing: {symptoms}.")
+    if when:
+        parts.append(f"This happens {when}.")
+    if extras:
+        parts.append(f"Additional details: {extras}.")
+
+    problem = " ".join(parts)
+
+    print(f"\nResearching: {problem}\n")
+    return problem
+
+
+def main() -> None:
+    """Run the research pipeline interactively or with a CLI argument.
+
+    If a problem description is passed as a command-line argument, it is
+    used directly. Otherwise, the user is prompted with a series of
+    questions to gather vehicle details and symptoms.
     """
     parser = argparse.ArgumentParser(description="Run the Auto Parts Research Agent workflow.")
     parser.add_argument(
         "problem",
         nargs="?",
-        default="2014 Ford Focus rough idle and intermittent check engine light",
-        help="Vehicle problem description to research.",
+        default=None,
+        help="Vehicle problem description. If omitted, you will be prompted.",
     )
     args = parser.parse_args()
 
-    result = run_research(args.problem)
+    problem = args.problem if args.problem else _gather_vehicle_info()
+
+    result = run_research(problem)
 
     print("\n===== FINAL RECOMMENDATION =====")
     print(result.get("recommendation") or "No recommendation approved.")
